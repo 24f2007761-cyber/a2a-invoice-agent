@@ -17,7 +17,6 @@ ALLOWED_ACTIONS = {
     "open_exception",
 }
 
-# Optional hosted LLM (Gemini, Groq, OpenRouter, OpenAI, etc.)
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
@@ -93,18 +92,62 @@ def _fix_rationale(text, action, refs, vendor="", invoice="", amount=0, currency
     return text[:1450]
 
 
-# ---------- High-Precision Deterministic Document Parser ----------
-
 DECOY_REGEX = re.compile(
     r"(?:cover\s*sheet|coversheet|transmittal|batch\s*intake|intake\s*form|intake\s*header|"
-    r"archive|historical|precedent|past\s*case|prior\s*case|sample\s*only|decoy|training\s*example|"
-    r"negative\s*sample|do\s*not\s*cite)",
+    r"archive|historical|precedent|past\s*case|prior\s*case|sample\s*case|sample\s*only|"
+    r"decoy|training\s*example|negative\s*sample|do\s*not\s*cite|ignore\s*this)",
     re.IGNORECASE,
 )
 
+DUPLICATE_KW = [
+    r"already\s*paid", r"previously\s*paid", r"duplicate\s*invoice",
+    r"prior\s*payment", r"settled\s*under\s*payment", r"paid\s*on\s*[\d\-]+",
+    r"identical\s*invoice", r"second\s*submission", r"prior\s*settlement"
+]
+
+EXCEPTION_KW = [
+    r"conflict", r"mismatch", r"discrepancy", r"variance\s*exceeds",
+    r"does\s*not\s*match", r"disputed", r"po\s*mismatch", r"quantity\s*mismatch",
+    r"unit\s*price\s*variance", r"vendor\s*mismatch", r"material\s*conflict",
+    r"bank\s*account\s*discrepancy", r"tax\s*id\s*mismatch", r"price\s*discrepancy"
+]
+
+HOLD_KW = [
+    r"hold\s*payment", r"payment\s*is\s*held", r"paused\s*until",
+    r"pending\s*verification", r"awaiting\s*verification", r"verification\s*required",
+    r"bank\s*details\s*change", r"bank\s*verification", r"kyc\s*pending",
+    r"tax\s*documentation\s*pending", r"tax\s*certificate\s*pending",
+    r"inspection\s*pending", r"proof\s*of\s*delivery\s*pending",
+    r"compliance\s*review\s*in\s*progress"
+]
+
+APPROVAL_KW = [
+    r"exceeds\s*delegated", r"exceeds\s*authority", r"outside\s*delegated",
+    r"outside\s*authority", r"exceeds\s*threshold", r"above\s*threshold",
+    r"requires\s*approval", r"manager\s*approval", r"director\s*approval",
+    r"approval\s*required", r"escalate\s*for\s*approval",
+    r"outside\s*autonomous\s*payment\s*limit"
+]
+
+SETTLE_KW = [
+    r"within\s*autonomous\s*authority", r"within\s*delegated\s*limit",
+    r"three-way\s*match\s*confirmed", r"3-way\s*match", r"reconciled\s*with",
+    r"all\s*goods\s*received", r"autonomous\s*payment\s*approved",
+    r"verified\s*and\s*approved\s*for\s*settlement", r"reconciled\s*and\s*within\s*authority"
+]
+
+
+def score_text(text, patterns):
+    score = 0
+    for pat in patterns:
+        if re.search(r"\b" + pat + r"\b", text, re.IGNORECASE):
+            score += 10
+        elif re.search(pat, text, re.IGNORECASE):
+            score += 5
+    return score
+
 
 def extract_package_facts(text, package_id):
-    # Vendor
     vendor = "Unknown Vendor"
     vm = re.search(r"(?:Vendor|Supplier|Seller|Billed\s*By|Company)\s*[:\-]\s*([^\n\r,\;]{2,60})", text, re.IGNORECASE)
     if vm:
@@ -112,7 +155,6 @@ def extract_package_facts(text, package_id):
         if v and not DECOY_REGEX.search(v):
             vendor = v
 
-    # Invoice Number
     invoice_num = ""
     im = re.search(r"(?:Invoice\s*(?:Number|No\.?|#)|Inv\s*#)\s*[:\-]?\s*([A-Za-z0-9\-_/]+)", text, re.IGNORECASE)
     if im:
@@ -121,14 +163,12 @@ def extract_package_facts(text, package_id):
             invoice_num = cand
 
     if not invoice_num:
-        # Fallback to finding alphanumeric token matching invoice pattern
         cand_m = re.search(r"\b(INV-[A-Za-z0-9\-]+)\b", text)
         if cand_m and cand_m.group(1) != package_id:
             invoice_num = cand_m.group(1)
         else:
             invoice_num = f"INV-{package_id}"
 
-    # Currency and Amount
     currency = "INR"
     amount_minor = 0
     cur_match = re.search(r"\b(INR|USD|EUR|GBP|AUD|CAD|SGD|JPY)\b", text)
@@ -153,59 +193,76 @@ def extract_package_facts(text, package_id):
 
 
 def analyze_decisive_paragraph(text):
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n|\r\n\s*\r\n", text) if p.strip()]
-    candidate_paras = []
+    raw_paras = re.split(r"\n\s*\n|\r\n\s*\r\n", text)
+    candidates = []
 
-    for p in paragraphs:
-        if DECOY_REGEX.search(p):
+    for p in raw_paras:
+        p_clean = p.strip()
+        if not p_clean or DECOY_REGEX.search(p_clean):
             continue
-        refs = collect_evidence_refs(p)
+        refs = collect_evidence_refs(p_clean)
         if len(refs) >= 3:
-            candidate_paras.append((p, refs[:3]))
+            candidates.append((p_clean, refs[:3]))
 
-    if not candidate_paras:
-        # Check all lines if double newline split didn't catch 3 refs
-        lines = [line.strip() for line in text.split("\n") if line.strip() and not DECOY_REGEX.search(line)]
-        for line in lines:
-            refs = collect_evidence_refs(line)
+    if not candidates:
+        for line in text.split("\n"):
+            line_clean = line.strip()
+            if not line_clean or DECOY_REGEX.search(line_clean):
+                continue
+            refs = collect_evidence_refs(line_clean)
             if len(refs) >= 3:
-                candidate_paras.append((line, refs[:3]))
+                candidates.append((line_clean, refs[:3]))
 
-    # Fallback to any 3 refs in non-decoy text
-    all_non_decoy_refs = []
-    for p in paragraphs:
+    non_decoy_refs = []
+    for p in raw_paras:
         if not DECOY_REGEX.search(p):
             for r in collect_evidence_refs(p):
-                if r not in all_non_decoy_refs:
-                    all_non_decoy_refs.append(r)
+                if r not in non_decoy_refs:
+                    non_decoy_refs.append(r)
 
-    chosen_para = candidate_paras[0][0] if candidate_paras else text
-    chosen_refs = candidate_paras[0][1] if candidate_paras else all_non_decoy_refs[:3]
+    best_para = text
+    best_refs = non_decoy_refs[:3] if len(non_decoy_refs) >= 3 else collect_evidence_refs(text)[:3]
 
-    while len(chosen_refs) < 3:
-        all_refs = collect_evidence_refs(text)
-        for r in all_refs:
-            if r not in chosen_refs:
-                chosen_refs.append(r)
-            if len(chosen_refs) == 3:
+    if candidates:
+        scored_candidates = []
+        for p, refs in candidates:
+            s_dup = score_text(p, DUPLICATE_KW)
+            s_exc = score_text(p, EXCEPTION_KW)
+            s_hld = score_text(p, HOLD_KW)
+            s_app = score_text(p, APPROVAL_KW)
+            s_set = score_text(p, SETTLE_KW)
+            total = s_dup + s_exc + s_hld + s_app + s_set
+            scored_candidates.append((total, p, refs))
+
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        best_para = scored_candidates[0][1]
+        best_refs = scored_candidates[0][2]
+
+    while len(best_refs) < 3:
+        for r in collect_evidence_refs(text):
+            if r not in best_refs:
+                best_refs.append(r)
+            if len(best_refs) == 3:
                 break
-        if len(chosen_refs) < 3:
-            chosen_refs.append(f"REF-{len(chosen_refs)+1}")
+        if len(best_refs) < 3:
+            best_refs.append(f"REF-{len(best_refs)+1}")
 
-    # Determine action from chosen paragraph / context
-    para_lower = (chosen_para + " " + text).lower()
-    if any(k in para_lower for k in ["duplicate", "already paid", "previously paid", "settled under payment", "second payment"]):
-        action = "reject_duplicate"
-    elif any(k in para_lower for k in ["mismatch", "conflict", "discrepancy", "variance exceeds", "does not match", "disputed"]):
-        action = "open_exception"
-    elif any(k in para_lower for k in ["hold", "pause", "pending verification", "awaiting tax", "bank account verification", "inspection pending"]):
-        action = "hold_invoice"
-    elif any(k in para_lower for k in ["exceeds delegated", "exceeds authority", "outside delegated", "requires approval", "manager approval", "threshold exceeded"]):
-        action = "request_approval"
-    else:
-        action = "settle_invoice"
+    eval_text = best_para + " " + text
+    scores = {
+        "reject_duplicate": score_text(eval_text, DUPLICATE_KW),
+        "open_exception": score_text(eval_text, EXCEPTION_KW),
+        "hold_invoice": score_text(eval_text, HOLD_KW),
+        "request_approval": score_text(eval_text, APPROVAL_KW),
+        "settle_invoice": score_text(eval_text, SETTLE_KW),
+    }
 
-    return action, chosen_refs[:3]
+    best_action = max(scores, key=scores.get)
+    if scores[best_action] == 0:
+        best_action = "open_exception"
+    elif best_action == "settle_invoice" and scores["settle_invoice"] < 10:
+        best_action = "open_exception"
+
+    return best_action, best_refs[:3]
 
 
 def parse_package_deterministically(package):
@@ -225,8 +282,6 @@ def parse_package_deterministically(package):
         "rationale": rationale,
     }
 
-
-# ---------- Validation & Sanitization ----------
 
 def validate_decision(raw, package):
     if not isinstance(raw, dict):
@@ -288,7 +343,7 @@ def validate_decision(raw, package):
     }
 
 
-# ---------- LLM Transport (OpenAI-Compatible & Gemini) ----------
+# ---------- LLM Transport ----------
 
 def _extract_json(text):
     text = text.strip()
@@ -353,7 +408,6 @@ def decide_batch(packages, policy, budget=35.0):
         key = package_key(pkg)
         by_key.setdefault(key, pkg)
 
-    # 1. Check persistent SQLite cache
     for key, pkg in list(by_key.items()):
         cached = _cache_get(key)
         if cached is not None:
@@ -364,7 +418,6 @@ def decide_batch(packages, policy, budget=35.0):
 
     misses = [(k, p) for k, p in by_key.items() if k not in decisions]
 
-    # 2. Try LLM if configured
     if misses and LLM_BASE_URL and LLM_API_KEY:
         rem = max(5.0, deadline - time.monotonic())
         try:
@@ -384,7 +437,6 @@ def decide_batch(packages, policy, budget=35.0):
         except Exception:
             pass
 
-    # 3. High-precision deterministic parser for any remaining unassigned packages
     for key, pkg in by_key.items():
         if key not in decisions:
             dec = parse_package_deterministically(pkg)

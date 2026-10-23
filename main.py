@@ -151,7 +151,8 @@ def validate_batch(batch):
         raise HTTPException(400, "INVALID_BATCH")
 
 
-def make_agent_card():
+def make_agent_card(target_url: str = None):
+    effective_url = target_url or BASE_URL
     return {
         "name": "Invoice Action Agent",
         "description": "Reviews invoice evidence, decides actions, and safely executes accepted proposals.",
@@ -168,7 +169,7 @@ def make_agent_card():
             "outputModes": [PROPOSAL_MEDIA, RECEIPT_MEDIA],
         }],
         "supportedInterfaces": [{
-            "url": BASE_URL,
+            "url": effective_url,
             "protocolBinding": "HTTP+JSON",
             "protocolVersion": "1.0",
         }],
@@ -335,7 +336,6 @@ def handle_message(principal, message):
         if row is not None:
             if row["message_hash"] != message_hash:
                 raise HTTPException(409, "IDEMPOTENCY_CONFLICT")
-            # Always return the current state of the task from storage (handles terminal replays)
             task_id = row["task_id"]
             with db() as conn:
                 task_row = conn.execute(
@@ -354,8 +354,15 @@ def handle_message(principal, message):
 # ---------- Routes ----------
 
 @app.get("/.well-known/agent-card.json")
-def agent_card():
-    return a2a_response(make_agent_card())
+def agent_card(request: Request):
+    origin = f"{request.url.scheme}://{request.url.netloc}"
+    req_base = f"{origin}/a2a/"
+    env_url = os.getenv("BASE_URL", "").strip()
+    if env_url and request.url.netloc in env_url:
+        card_url = env_url.rstrip("/") + "/"
+    else:
+        card_url = req_base
+    return a2a_response(make_agent_card(card_url))
 
 
 @router.post("/message:send")
@@ -446,9 +453,6 @@ def cancel_task(
     return a2a_response(task)
 
 
-# Mount router
 app.include_router(router)
 if BASE_PATH:
-    # Also support requests without prefix if configured
     app.include_router(router, prefix="")
-
