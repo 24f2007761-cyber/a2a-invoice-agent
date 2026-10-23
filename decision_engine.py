@@ -5,6 +5,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 from database import db
 
@@ -29,8 +30,8 @@ def canonical_hash(data):
 
 
 def package_key(package):
-    # Prefix with v2_ to invalidate any old stale cache from previous runs
-    return "v2_" + canonical_hash({k: v for k, v in package.items() if k != "packageId"})
+    # Prefix v3_ to guarantee a fresh, clean evaluation cache
+    return "v3_" + canonical_hash({k: v for k, v in package.items() if k != "packageId"})
 
 
 def collect_package_text(value):
@@ -136,12 +137,10 @@ def extract_package_facts(text, package_id):
 
 
 def find_decisive_paragraph_and_refs(text):
-    # Split text into paragraphs by blank lines or line breaks
     chunks = re.split(r"\n\s*\n|\r\n\s*\r\n", text)
     if len(chunks) <= 1:
         chunks = [c.strip() for c in text.split("\n") if c.strip()]
 
-    # Collect reference blocks
     valid_blocks = []
     for c in chunks:
         refs = collect_evidence_refs(c)
@@ -150,24 +149,20 @@ def find_decisive_paragraph_and_refs(text):
         is_decoy = bool(DECOY_RE.search(c))
         valid_blocks.append({"text": c, "refs": refs, "is_decoy": is_decoy})
 
-    # Find the non-decoy block with 3 references
     non_decoys = [b for b in valid_blocks if not b["is_decoy"]]
 
     best_block = None
-    # 1. Look for non-decoy with exactly 3 refs
     for b in non_decoys:
         if len(b["refs"]) == 3:
             best_block = b
             break
 
-    # 2. Look for non-decoy with >= 3 refs
     if not best_block:
         for b in non_decoys:
             if len(b["refs"]) >= 3:
                 best_block = b
                 break
 
-    # 3. Fallback to any non-decoy
     if not best_block and non_decoys:
         best_block = non_decoys[0]
 
@@ -178,7 +173,6 @@ def find_decisive_paragraph_and_refs(text):
         chosen_text = text
         chosen_refs = collect_evidence_refs(text)[:3]
 
-    # Ensure 3 refs
     while len(chosen_refs) < 3:
         for r in collect_evidence_refs(text):
             if r not in chosen_refs:
@@ -188,16 +182,12 @@ def find_decisive_paragraph_and_refs(text):
         if len(chosen_refs) < 3:
             chosen_refs.append(f"REF-{len(chosen_refs)+1}")
 
-    # Determine action exclusively on the decisive paragraph
     p_lower = chosen_text.lower()
-
-    # Negation indicators
     has_no_duplicate = bool(re.search(r"\b(?:not\s*a\s*duplicate|no\s*duplicate|different\s*invoice|not\s*previously\s*paid)\b", p_lower))
     has_no_exception = bool(re.search(r"\b(?:no\s*discrepanc|zero\s*variance|no\s*mismatch|no\s*conflict|reconciled|matched)\b", p_lower))
     has_no_approval = bool(re.search(r"\b(?:no\s*approval\s*needed|within\s*(?:delegated|autonomous)\s*(?:authority|limit)|within\s*threshold)\b", p_lower))
     has_no_hold = bool(re.search(r"\b(?:no\s*hold|verified\s*without\s*hold|all\s*verifications?\s*complete)\b", p_lower))
 
-    # Priority Action Logic
     if not has_no_duplicate and re.search(r"\b(?:already\s*paid|previously\s*paid|duplicate\s*invoice|prior\s*payment|settled\s*under\s*payment)\b", p_lower):
         action = "reject_duplicate"
     elif re.search(r"\b(?:hold\s*payment|payment\s*is\s*held|paused\s*until|pending\s*verification|verification\s*required|kyc\s*pending|tax\s*(?:certificate|documentation)\s*pending|inspection\s*pending)\b", p_lower) and not has_no_hold:
@@ -294,6 +284,57 @@ def validate_decision(raw, package):
     }
 
 
+# ---------- LLM Caller (Groq / Gemini) ----------
+
+def call_llm_single(package, timeout=18.0):
+    if not LLM_BASE_URL or not LLM_API_KEY:
+        return None
+
+    text = collect_package_text(package)
+    pid = package.get("packageId", "")
+
+    user_msg = (
+        f"Invoice Package ID: {pid}\n"
+        f"Document text:\n{text[:9000]}\n\n"
+        "Instructions:\n"
+        "1. Identify the ONE non-decoy paragraph determining the action (ignore cover sheets, training decoys, and archive examples).\n"
+        "2. Choose one exact action: settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.\n"
+        "3. Extract exactly three bracketed references from that decisive paragraph (without brackets).\n"
+        "4. Extract vendorName, invoiceNumber (NOT packageId), amountMinor (integer in minor currency units), and currency (3 uppercase letters).\n"
+        "5. Return a JSON object with keys: action, vendorName, invoiceNumber, amountMinor, currency, evidenceRefs, rationale."
+    )
+
+    body = {
+        "model": LLM_MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": "You are an AP invoice analysis expert. Return ONLY valid JSON."},
+            {"role": "user", "content": user_msg},
+        ],
+    }
+
+    req = urllib.request.Request(
+        LLM_BASE_URL + "/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + LLM_API_KEY,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        content = data["choices"][0]["message"]["content"]
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip())
+        raw = json.loads(content)
+        return validate_decision(raw, package)
+    except Exception:
+        return None
+
+
 # ---------- Public Batch API ----------
 
 def _cache_get(key):
@@ -320,7 +361,7 @@ def decide_batch(packages, policy, budget=35.0):
         key = package_key(pkg)
         by_key.setdefault(key, pkg)
 
-    # Read clean cache
+    # 1. Read clean cache
     for key, pkg in list(by_key.items()):
         cached = _cache_get(key)
         if cached is not None:
@@ -329,7 +370,23 @@ def decide_batch(packages, policy, budget=35.0):
             except ValueError:
                 pass
 
-    # Process all un-decided packages with the fresh non-decoy parser
+    misses = [(k, p) for k, p in by_key.items() if k not in decisions]
+
+    # 2. Call LLM for misses in parallel (using Groq / Gemini)
+    if misses and LLM_BASE_URL and LLM_API_KEY:
+        with ThreadPoolExecutor(max_workers=min(6, len(misses))) as pool:
+            futures = {pool.submit(call_llm_single, pkg, 18.0): (key, pkg) for key, pkg in misses}
+            for fut in futures:
+                key, pkg = futures[fut]
+                try:
+                    dec = fut.result()
+                    if dec:
+                        decisions[key] = dec
+                        _cache_put(key, dec)
+                except Exception:
+                    pass
+
+    # 3. Fallback to precision deterministic parser
     for key, pkg in by_key.items():
         if key not in decisions:
             dec = parse_package_deterministically(pkg)
