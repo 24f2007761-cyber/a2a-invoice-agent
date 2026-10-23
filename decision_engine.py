@@ -30,8 +30,8 @@ def canonical_hash(data):
 
 
 def package_key(package):
-    # Prefix v3_ to guarantee a fresh, clean evaluation cache
-    return "v3_" + canonical_hash({k: v for k, v in package.items() if k != "packageId"})
+    # Prefix v4_ to completely bypass any stale cached decisions
+    return "v4_" + canonical_hash({k: v for k, v in package.items() if k != "packageId"})
 
 
 def collect_package_text(value):
@@ -77,8 +77,6 @@ def _fix_rationale(text, action, refs, vendor="", invoice="", amount=0, currency
         )
     return text[:1450]
 
-
-# ---------- Decoy & Reference Block Isolation ----------
 
 DECOY_PATTERNS = [
     r"cover\s*sheet", r"coversheet", r"transmittal", r"batch\s*intake",
@@ -136,7 +134,7 @@ def extract_package_facts(text, package_id):
     return vendor, invoice_num, amount_minor, currency
 
 
-def find_decisive_paragraph_and_refs(text):
+def find_decisive_paragraph_and_refs(text, policy=None):
     chunks = re.split(r"\n\s*\n|\r\n\s*\r\n", text)
     if len(chunks) <= 1:
         chunks = [c.strip() for c in text.split("\n") if c.strip()]
@@ -206,11 +204,11 @@ def find_decisive_paragraph_and_refs(text):
     return action, chosen_refs[:3]
 
 
-def parse_package_deterministically(package):
+def parse_package_deterministically(package, policy=None):
     text = collect_package_text(package)
     pid = package.get("packageId", "")
     vendor, invoice_num, amount_minor, currency = extract_package_facts(text, pid)
-    action, refs = find_decisive_paragraph_and_refs(text)
+    action, refs = find_decisive_paragraph_and_refs(text, policy)
     rationale = _fix_rationale("", action, refs, vendor, invoice_num, amount_minor, currency)
 
     return {
@@ -284,24 +282,34 @@ def validate_decision(raw, package):
     }
 
 
-# ---------- LLM Caller (Groq / Gemini) ----------
+# ---------- LLM Caller (Policy-Aware) ----------
 
-def call_llm_single(package, timeout=18.0):
+def call_llm_single(package, policy, timeout=20.0):
     if not LLM_BASE_URL or not LLM_API_KEY:
+        print("[LLM] Missing LLM credentials", flush=True)
         return None
 
-    text = collect_package_text(package)
+    policy_str = json.dumps(policy, ensure_ascii=False) if isinstance(policy, dict) else str(policy)
+    pkg_text = collect_package_text(package)
     pid = package.get("packageId", "")
 
     user_msg = (
-        f"Invoice Package ID: {pid}\n"
-        f"Document text:\n{text[:9000]}\n\n"
-        "Instructions:\n"
-        "1. Identify the ONE non-decoy paragraph determining the action (ignore cover sheets, training decoys, and archive examples).\n"
-        "2. Choose one exact action: settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.\n"
-        "3. Extract exactly three bracketed references from that decisive paragraph (without brackets).\n"
-        "4. Extract vendorName, invoiceNumber (NOT packageId), amountMinor (integer in minor currency units), and currency (3 uppercase letters).\n"
-        "5. Return a JSON object with keys: action, vendorName, invoiceNumber, amountMinor, currency, evidenceRefs, rationale."
+        f"INVOICE POLICY RULES:\n{policy_str}\n\n"
+        f"PACKAGE ID: {pid}\n"
+        f"DOCUMENT TEXT:\n{pkg_text[:10000]}\n\n"
+        "INSTRUCTIONS:\n"
+        "1. Check the policy rules (including autonomous authority limits, verification holds, and duplicate payment rules).\n"
+        "2. Choose EXACTLY ONE action:\n"
+        "   - settle_invoice: valid, reconciled, and within autonomous payment authority limit.\n"
+        "   - request_approval: valid and reconciled, but amount exceeds autonomous delegated authority limit.\n"
+        "   - hold_invoice: payment pauses until a specific verification completes (bank, tax, inspection).\n"
+        "   - reject_duplicate: the SAME commercial invoice (same vendor, number, amount) was already paid.\n"
+        "   - open_exception: material records conflict (amounts, PO mismatch, vendor mismatch).\n"
+        "3. Find the ONE decisive non-decoy paragraph determining the action (ignore cover sheets, archive examples, training decoys).\n"
+        "4. Extract exactly three bracketed references from that decisive paragraph (without brackets).\n"
+        "5. Extract vendorName, invoiceNumber (NOT packageId), amountMinor (integer minor currency units), and currency.\n"
+        "6. Write rationale naming the action and citing at least two evidence refs in square brackets [REF].\n\n"
+        "Return ONLY a JSON object: {\"action\":\"...\",\"vendorName\":\"...\",\"invoiceNumber\":\"...\",\"amountMinor\":123,\"currency\":\"INR\",\"evidenceRefs\":[\"a\",\"b\",\"c\"],\"rationale\":\"...\"}"
     )
 
     body = {
@@ -309,7 +317,7 @@ def call_llm_single(package, timeout=18.0):
         "temperature": 0,
         "response_format": {"type": "json_object"},
         "messages": [
-            {"role": "system", "content": "You are an AP invoice analysis expert. Return ONLY valid JSON."},
+            {"role": "system", "content": "You are a professional accounts-payable invoice auditor. Return ONLY a valid JSON object."},
             {"role": "user", "content": user_msg},
         ],
     }
@@ -330,8 +338,11 @@ def call_llm_single(package, timeout=18.0):
         content = data["choices"][0]["message"]["content"]
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip())
         raw = json.loads(content)
-        return validate_decision(raw, package)
-    except Exception:
+        val = validate_decision(raw, package)
+        print(f"[LLM SUCCESS] Package {pid} -> {val['action']}", flush=True)
+        return val
+    except Exception as exc:
+        print(f"[LLM ERROR] Package {pid}: {exc}", flush=True)
         return None
 
 
@@ -372,10 +383,11 @@ def decide_batch(packages, policy, budget=35.0):
 
     misses = [(k, p) for k, p in by_key.items() if k not in decisions]
 
-    # 2. Call LLM for misses in parallel (using Groq / Gemini)
+    # 2. Call LLM for misses in parallel (up to 4 concurrent threads to stay well within rate limits)
     if misses and LLM_BASE_URL and LLM_API_KEY:
-        with ThreadPoolExecutor(max_workers=min(6, len(misses))) as pool:
-            futures = {pool.submit(call_llm_single, pkg, 18.0): (key, pkg) for key, pkg in misses}
+        print(f"[BATCH] Processing {len(misses)} packages with LLM...", flush=True)
+        with ThreadPoolExecutor(max_workers=min(4, len(misses))) as pool:
+            futures = {pool.submit(call_llm_single, pkg, policy, 20.0): (key, pkg) for key, pkg in misses}
             for fut in futures:
                 key, pkg = futures[fut]
                 try:
@@ -383,13 +395,13 @@ def decide_batch(packages, policy, budget=35.0):
                     if dec:
                         decisions[key] = dec
                         _cache_put(key, dec)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[BATCH ERROR] {e}", flush=True)
 
     # 3. Fallback to precision deterministic parser
     for key, pkg in by_key.items():
         if key not in decisions:
-            dec = parse_package_deterministically(pkg)
+            dec = parse_package_deterministically(pkg, policy)
             decisions[key] = dec
             _cache_put(key, dec)
 
