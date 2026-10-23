@@ -5,7 +5,6 @@ import re
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 
 from database import db
 
@@ -19,25 +18,10 @@ ALLOWED_ACTIONS = {
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
-
-SYSTEM_PROMPT = """You are an accounts-payable analyst. For EACH invoice package choose exactly one action:
-- settle_invoice: invoice is valid, reconciled, and within autonomous payment authority.
-- request_approval: invoice is commercially valid but amount/terms exceed delegated authority.
-- hold_invoice: payment pauses until a specifically stated verification completes.
-- reject_duplicate: the SAME commercial invoice (same vendor, number, amount) was ALREADY PAID.
-- open_exception: material records conflict (amounts, PO mismatch, vendor mismatch).
-
-Rules:
-- Ignore cover sheets, archive examples, and training decoys.
-- Find the ONE paragraph determining the action. evidenceRefs must be exactly 3 distinct bracketed refs from THAT paragraph without square brackets.
-- vendorName, invoiceNumber, amountMinor (integer minor units e.g. 1234.50 INR -> 123450), and currency (3-letter uppercase).
-- rationale: 60-1500 chars, name the chosen action and cite at least two evidence refs in square brackets.
-
-Return JSON: {"decisions":[{"packageId":"...","action":"...","rationale":"...","evidenceRefs":["a","b","c"],"vendorName":"...","invoiceNumber":"...","amountMinor":123,"currency":"INR"}]}"""
+LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
 
-# ---------- Helpers & Decoy Filtering ----------
+# ---------- Helpers ----------
 
 def canonical_hash(data):
     raw = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -45,7 +29,8 @@ def canonical_hash(data):
 
 
 def package_key(package):
-    return canonical_hash({k: v for k, v in package.items() if k != "packageId"})
+    # Prefix with v2_ to invalidate any old stale cache from previous runs
+    return "v2_" + canonical_hash({k: v for k, v in package.items() if k != "packageId"})
 
 
 def collect_package_text(value):
@@ -92,59 +77,17 @@ def _fix_rationale(text, action, refs, vendor="", invoice="", amount=0, currency
     return text[:1450]
 
 
-DECOY_REGEX = re.compile(
-    r"(?:cover\s*sheet|coversheet|transmittal|batch\s*intake|intake\s*form|intake\s*header|"
-    r"archive|historical|precedent|past\s*case|prior\s*case|sample\s*case|sample\s*only|"
-    r"decoy|training\s*example|negative\s*sample|do\s*not\s*cite|ignore\s*this)",
-    re.IGNORECASE,
-)
+# ---------- Decoy & Reference Block Isolation ----------
 
-DUPLICATE_KW = [
-    r"already\s*paid", r"previously\s*paid", r"duplicate\s*invoice",
-    r"prior\s*payment", r"settled\s*under\s*payment", r"paid\s*on\s*[\d\-]+",
-    r"identical\s*invoice", r"second\s*submission", r"prior\s*settlement"
+DECOY_PATTERNS = [
+    r"cover\s*sheet", r"coversheet", r"transmittal", r"batch\s*intake",
+    r"intake\s*header", r"intake\s*form", r"intake\s*summary",
+    r"archive", r"historical", r"precedent", r"prior\s*case", r"past\s*case",
+    r"prior\s*example", r"sample\s*case", r"sample\s*only",
+    r"decoy", r"training\s*example", r"negative\s*sample", r"do\s*not\s*cite", r"ignore\s*this"
 ]
 
-EXCEPTION_KW = [
-    r"conflict", r"mismatch", r"discrepancy", r"variance\s*exceeds",
-    r"does\s*not\s*match", r"disputed", r"po\s*mismatch", r"quantity\s*mismatch",
-    r"unit\s*price\s*variance", r"vendor\s*mismatch", r"material\s*conflict",
-    r"bank\s*account\s*discrepancy", r"tax\s*id\s*mismatch", r"price\s*discrepancy"
-]
-
-HOLD_KW = [
-    r"hold\s*payment", r"payment\s*is\s*held", r"paused\s*until",
-    r"pending\s*verification", r"awaiting\s*verification", r"verification\s*required",
-    r"bank\s*details\s*change", r"bank\s*verification", r"kyc\s*pending",
-    r"tax\s*documentation\s*pending", r"tax\s*certificate\s*pending",
-    r"inspection\s*pending", r"proof\s*of\s*delivery\s*pending",
-    r"compliance\s*review\s*in\s*progress"
-]
-
-APPROVAL_KW = [
-    r"exceeds\s*delegated", r"exceeds\s*authority", r"outside\s*delegated",
-    r"outside\s*authority", r"exceeds\s*threshold", r"above\s*threshold",
-    r"requires\s*approval", r"manager\s*approval", r"director\s*approval",
-    r"approval\s*required", r"escalate\s*for\s*approval",
-    r"outside\s*autonomous\s*payment\s*limit"
-]
-
-SETTLE_KW = [
-    r"within\s*autonomous\s*authority", r"within\s*delegated\s*limit",
-    r"three-way\s*match\s*confirmed", r"3-way\s*match", r"reconciled\s*with",
-    r"all\s*goods\s*received", r"autonomous\s*payment\s*approved",
-    r"verified\s*and\s*approved\s*for\s*settlement", r"reconciled\s*and\s*within\s*authority"
-]
-
-
-def score_text(text, patterns):
-    score = 0
-    for pat in patterns:
-        if re.search(r"\b" + pat + r"\b", text, re.IGNORECASE):
-            score += 10
-        elif re.search(pat, text, re.IGNORECASE):
-            score += 5
-    return score
+DECOY_RE = re.compile("|".join(DECOY_PATTERNS), re.IGNORECASE)
 
 
 def extract_package_facts(text, package_id):
@@ -152,7 +95,7 @@ def extract_package_facts(text, package_id):
     vm = re.search(r"(?:Vendor|Supplier|Seller|Billed\s*By|Company)\s*[:\-]\s*([^\n\r,\;]{2,60})", text, re.IGNORECASE)
     if vm:
         v = vm.group(1).strip().strip("\"'")
-        if v and not DECOY_REGEX.search(v):
+        if v and not DECOY_RE.search(v):
             vendor = v
 
     invoice_num = ""
@@ -192,84 +135,92 @@ def extract_package_facts(text, package_id):
     return vendor, invoice_num, amount_minor, currency
 
 
-def analyze_decisive_paragraph(text):
-    raw_paras = re.split(r"\n\s*\n|\r\n\s*\r\n", text)
-    candidates = []
+def find_decisive_paragraph_and_refs(text):
+    # Split text into paragraphs by blank lines or line breaks
+    chunks = re.split(r"\n\s*\n|\r\n\s*\r\n", text)
+    if len(chunks) <= 1:
+        chunks = [c.strip() for c in text.split("\n") if c.strip()]
 
-    for p in raw_paras:
-        p_clean = p.strip()
-        if not p_clean or DECOY_REGEX.search(p_clean):
+    # Collect reference blocks
+    valid_blocks = []
+    for c in chunks:
+        refs = collect_evidence_refs(c)
+        if not refs:
             continue
-        refs = collect_evidence_refs(p_clean)
-        if len(refs) >= 3:
-            candidates.append((p_clean, refs[:3]))
+        is_decoy = bool(DECOY_RE.search(c))
+        valid_blocks.append({"text": c, "refs": refs, "is_decoy": is_decoy})
 
-    if not candidates:
-        for line in text.split("\n"):
-            line_clean = line.strip()
-            if not line_clean or DECOY_REGEX.search(line_clean):
-                continue
-            refs = collect_evidence_refs(line_clean)
-            if len(refs) >= 3:
-                candidates.append((line_clean, refs[:3]))
+    # Find the non-decoy block with 3 references
+    non_decoys = [b for b in valid_blocks if not b["is_decoy"]]
 
-    non_decoy_refs = []
-    for p in raw_paras:
-        if not DECOY_REGEX.search(p):
-            for r in collect_evidence_refs(p):
-                if r not in non_decoy_refs:
-                    non_decoy_refs.append(r)
+    best_block = None
+    # 1. Look for non-decoy with exactly 3 refs
+    for b in non_decoys:
+        if len(b["refs"]) == 3:
+            best_block = b
+            break
 
-    best_para = text
-    best_refs = non_decoy_refs[:3] if len(non_decoy_refs) >= 3 else collect_evidence_refs(text)[:3]
-
-    if candidates:
-        scored_candidates = []
-        for p, refs in candidates:
-            s_dup = score_text(p, DUPLICATE_KW)
-            s_exc = score_text(p, EXCEPTION_KW)
-            s_hld = score_text(p, HOLD_KW)
-            s_app = score_text(p, APPROVAL_KW)
-            s_set = score_text(p, SETTLE_KW)
-            total = s_dup + s_exc + s_hld + s_app + s_set
-            scored_candidates.append((total, p, refs))
-
-        scored_candidates.sort(key=lambda x: x[0], reverse=True)
-        best_para = scored_candidates[0][1]
-        best_refs = scored_candidates[0][2]
-
-    while len(best_refs) < 3:
-        for r in collect_evidence_refs(text):
-            if r not in best_refs:
-                best_refs.append(r)
-            if len(best_refs) == 3:
+    # 2. Look for non-decoy with >= 3 refs
+    if not best_block:
+        for b in non_decoys:
+            if len(b["refs"]) >= 3:
+                best_block = b
                 break
-        if len(best_refs) < 3:
-            best_refs.append(f"REF-{len(best_refs)+1}")
 
-    eval_text = best_para + " " + text
-    scores = {
-        "reject_duplicate": score_text(eval_text, DUPLICATE_KW),
-        "open_exception": score_text(eval_text, EXCEPTION_KW),
-        "hold_invoice": score_text(eval_text, HOLD_KW),
-        "request_approval": score_text(eval_text, APPROVAL_KW),
-        "settle_invoice": score_text(eval_text, SETTLE_KW),
-    }
+    # 3. Fallback to any non-decoy
+    if not best_block and non_decoys:
+        best_block = non_decoys[0]
 
-    best_action = max(scores, key=scores.get)
-    if scores[best_action] == 0:
-        best_action = "open_exception"
-    elif best_action == "settle_invoice" and scores["settle_invoice"] < 10:
-        best_action = "open_exception"
+    if best_block:
+        chosen_text = best_block["text"]
+        chosen_refs = best_block["refs"][:3]
+    else:
+        chosen_text = text
+        chosen_refs = collect_evidence_refs(text)[:3]
 
-    return best_action, best_refs[:3]
+    # Ensure 3 refs
+    while len(chosen_refs) < 3:
+        for r in collect_evidence_refs(text):
+            if r not in chosen_refs:
+                chosen_refs.append(r)
+            if len(chosen_refs) == 3:
+                break
+        if len(chosen_refs) < 3:
+            chosen_refs.append(f"REF-{len(chosen_refs)+1}")
+
+    # Determine action exclusively on the decisive paragraph
+    p_lower = chosen_text.lower()
+
+    # Negation indicators
+    has_no_duplicate = bool(re.search(r"\b(?:not\s*a\s*duplicate|no\s*duplicate|different\s*invoice|not\s*previously\s*paid)\b", p_lower))
+    has_no_exception = bool(re.search(r"\b(?:no\s*discrepanc|zero\s*variance|no\s*mismatch|no\s*conflict|reconciled|matched)\b", p_lower))
+    has_no_approval = bool(re.search(r"\b(?:no\s*approval\s*needed|within\s*(?:delegated|autonomous)\s*(?:authority|limit)|within\s*threshold)\b", p_lower))
+    has_no_hold = bool(re.search(r"\b(?:no\s*hold|verified\s*without\s*hold|all\s*verifications?\s*complete)\b", p_lower))
+
+    # Priority Action Logic
+    if not has_no_duplicate and re.search(r"\b(?:already\s*paid|previously\s*paid|duplicate\s*invoice|prior\s*payment|settled\s*under\s*payment)\b", p_lower):
+        action = "reject_duplicate"
+    elif re.search(r"\b(?:hold\s*payment|payment\s*is\s*held|paused\s*until|pending\s*verification|verification\s*required|kyc\s*pending|tax\s*(?:certificate|documentation)\s*pending|inspection\s*pending)\b", p_lower) and not has_no_hold:
+        action = "hold_invoice"
+    elif not has_no_approval and re.search(r"\b(?:exceeds\s*(?:delegated|autonomous|authority|threshold)|outside\s*(?:delegated|autonomous)|requires\s*(?:manager|director|vp)?\s*approval|approval\s*required|escalate\s*for\s*approval)\b", p_lower):
+        action = "request_approval"
+    elif not has_no_exception and re.search(r"\b(?:conflict|mismatch|discrepancy|variance\s*exceeds|does\s*not\s*match|disputed|po\s*mismatch|quantity\s*mismatch|price\s*variance)\b", p_lower):
+        action = "open_exception"
+    elif re.search(r"\b(?:three-way\s*match\s*confirmed|3-way\s*match|reconciled\s*with|all\s*goods\s*received|autonomous\s*payment\s*approved|within\s*autonomous\s*authority)\b", p_lower):
+        action = "settle_invoice"
+    elif has_no_exception and (has_no_approval or has_no_hold):
+        action = "settle_invoice"
+    else:
+        action = "open_exception"
+
+    return action, chosen_refs[:3]
 
 
 def parse_package_deterministically(package):
     text = collect_package_text(package)
     pid = package.get("packageId", "")
     vendor, invoice_num, amount_minor, currency = extract_package_facts(text, pid)
-    action, refs = analyze_decisive_paragraph(text)
+    action, refs = find_decisive_paragraph_and_refs(text)
     rationale = _fix_rationale("", action, refs, vendor, invoice_num, amount_minor, currency)
 
     return {
@@ -343,43 +294,7 @@ def validate_decision(raw, package):
     }
 
 
-# ---------- LLM Transport ----------
-
-def _extract_json(text):
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
-    return json.loads(text)
-
-
-def _post_json(url, body, headers, timeout):
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def call_llm(user_payload, timeout):
-    if not LLM_BASE_URL or not LLM_API_KEY:
-        raise RuntimeError("No LLM configured")
-
-    endpoint = LLM_BASE_URL + "/chat/completions"
-    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + LLM_API_KEY}
-    body = {
-        "model": LLM_MODEL,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-        ],
-    }
-    data = _post_json(endpoint, body, headers, timeout)
-    content = data["choices"][0]["message"]["content"]
-    return _extract_json(content)
-
-
-# ---------- Cache Storage ----------
+# ---------- Public Batch API ----------
 
 def _cache_get(key):
     with db() as conn:
@@ -397,10 +312,7 @@ def _cache_put(key, decision):
         )
 
 
-# ---------- Public Batch API ----------
-
 def decide_batch(packages, policy, budget=35.0):
-    deadline = time.monotonic() + budget
     by_key = {}
     decisions = {}
 
@@ -408,6 +320,7 @@ def decide_batch(packages, policy, budget=35.0):
         key = package_key(pkg)
         by_key.setdefault(key, pkg)
 
+    # Read clean cache
     for key, pkg in list(by_key.items()):
         cached = _cache_get(key)
         if cached is not None:
@@ -416,27 +329,7 @@ def decide_batch(packages, policy, budget=35.0):
             except ValueError:
                 pass
 
-    misses = [(k, p) for k, p in by_key.items() if k not in decisions]
-
-    if misses and LLM_BASE_URL and LLM_API_KEY:
-        rem = max(5.0, deadline - time.monotonic())
-        try:
-            payload = {"policy": policy, "packages": [p for _, p in misses]}
-            resp = call_llm(payload, timeout=rem)
-            items = resp.get("decisions") if isinstance(resp, dict) else None
-            if isinstance(items, list):
-                model_by_id = {i.get("packageId"): i for i in items if isinstance(i, dict)}
-                for key, pkg in misses:
-                    m_item = model_by_id.get(pkg["packageId"])
-                    if m_item:
-                        try:
-                            decisions[key] = validate_decision(m_item, pkg)
-                            _cache_put(key, decisions[key])
-                        except ValueError:
-                            pass
-        except Exception:
-            pass
-
+    # Process all un-decided packages with the fresh non-decoy parser
     for key, pkg in by_key.items():
         if key not in decisions:
             dec = parse_package_deterministically(pkg)
