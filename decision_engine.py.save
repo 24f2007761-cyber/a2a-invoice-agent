@@ -1,0 +1,129 @@
+import re
+import hashlib
+import json
+import os
+import urllib.request
+import urllib.error
+
+ALLOWED_ACTIONS = {
+    "settle_invoice",
+    "request_approval",
+    "hold_invoice",
+    "reject_duplicate",
+    "open_exception",
+}
+
+OLLAMA_URL = os.getenv(
+    "OLLAMA_URL", "http://127.0.0.1:11434/api/chat"
+)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:1b-it-qat")
+
+
+def canonical_hash(data):
+    """Create a stable hash for JSON data."""
+    raw = json.dumps(
+        data,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def call_ollama(package, policy):
+    """Ask the local model for a structured proposal."""
+    prompt = {
+        "instructions": (
+            "Analyze only the supplied invoice package and policy. "
+            "Never invent facts or evidence references. "
+            "Missing approval alone does not prove a duplicate. "
+            "Use only these actions: "
+            + ", ".join(sorted(ALLOWED_ACTIONS))
+            + ". Return JSON with action, rationale, evidenceRefs, "
+            "vendorName, invoiceNumber, amountMinor, currency."
+        ),
+        "policy": policy,
+        "package": package,
+    }
+
+    request_body = json.dumps({
+        "model": OLLAMA_MODEL,
+        "stream": False,
+        "format": "json",
+        "messages": [{
+            "role": "user",
+            "content": json.dumps(prompt, ensure_ascii=False),
+        }],
+        "options": {"temperature": 0},
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=request_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        return json.loads(result["message"]["content"])
+    except (urllib.error.URLError, TimeoutError, KeyError,
+            TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Invoice model request failed") from exc
+
+
+def decide_package(package, policy):
+    """Return a validated decision or fail closed."""
+    if not isinstance(package, dict):
+        raise ValueError("Package must be a JSON object")
+    result = call_ollama(package, policy)
+
+    if not isinstance(result, dict):
+        raise ValueError("Model response must be a JSON object")
+
+    action = result.get("action")
+    rationale = result.get("rationale")
+    refs = result.get("evidenceRefs")
+
+    if action not in ALLOWED_ACTIONS:
+        raise ValueError("Model returned an unsupported action")
+
+    if not isinstance(rationale, str) or not 60 <= len(rationale) <= 1500:
+        raise ValueError("Rationale must be 60–1500 characters")
+
+    if (
+        not isinstance(refs, list)
+        or len(refs) != 3
+        or any(not isinstance(ref, str) or not ref.strip() for ref in refs)
+        or len(set(refs)) != 3
+    ):
+        raise ValueError("Exactly three distinct evidence references are required")
+    # Validate references against IDs actually present in the package.
+    # This deliberately fails closed until the package's evidence schema
+    # has been confirmed and supported below.
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key.lower() in {
+                    "evidenceref", "evidence_ref", "evidenceid",
+                    "evidence_id", "documentid", "document_id",
+                } and isinstance(item, str):
+                    known_refs.add(item)
+                collect_refs(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect_refs(item)
+
+    collect_refs(package)
+
+    if not known_refs or any(
+        not isinstance(ref, str) or ref not in known_refs for ref in refs
+    ):
+        raise ValueError(
+            "Evidence schema is not verified or a reference is unsupported"
+        )
+
+    if len(set(refs)) != len(refs):
+        raise ValueError("Evidence references must be distinct")
+
+    return result
